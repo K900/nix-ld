@@ -5,6 +5,7 @@
 #include <nolibc.h>
 
 #include "strerror.h"
+#include <stdbool.h>
 #include <stdio.h>
 #include <config.h>
 
@@ -40,9 +41,8 @@ struct ld_ctx {
   const char *nix_ld;
   char *nix_ld_lib_path;
   char *ld_lib_path;
+  char **envp;
   char **ld_lib_path_envp;
-  const char *nix_ld_env_prefix;
-  const char *nix_lib_path_prefix;
 
   // filled out by elf_load
   unsigned long load_addr;
@@ -91,7 +91,6 @@ static struct ld_ctx init_ld_ctx(int argc, char **argv, char** envp, size_t *aux
       .ld_lib_path = NULL,
       .nix_ld = NULL,
       .nix_ld_lib_path = NULL,
-      .nix_lib_path_prefix = "NIX_LD_LIBRARY_PATH_" NIX_SYSTEM "=",
   };
 
   for (; auxv[0]; auxv += 2) {
@@ -101,22 +100,43 @@ static struct ld_ctx init_ld_ctx(int argc, char **argv, char** envp, size_t *aux
     }
   }
 
+  int envp_size = 0;
+  for (char **e = envp; *e; e++) {
+    envp_size += 1;
+  }
+  envp_size += 2;  // one for null terminator, one for LD_LIBRARY_PATH
+
+  char** new_envp = mmap(NULL, envp_size * sizeof(char*), PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+  int envp_current = 0;
+  
   char *val;
   for (char **e = envp; *e; e++) {
+    bool skip = false;
     if ((val = get_env(*e, "NIX_LD_" NIX_SYSTEM "="))) {
       ctx.nix_ld = val;
+      skip = true;
     } else if (!ctx.nix_ld && (val = get_env(*e, "NIX_LD="))) {
       ctx.nix_ld = val;
-    } else if ((val = get_env(*e, ctx.nix_lib_path_prefix))) {
+      skip = true;
+    } else if ((val = get_env(*e, "NIX_LD_LIBRARY_PATH_" NIX_SYSTEM "="))) {
       ctx.nix_ld_lib_path = val;
+      skip = true;
     } else if (!ctx.nix_ld_lib_path && (val = get_env(*e, "NIX_LD_LIBRARY_PATH="))) {
-      ctx.nix_lib_path_prefix = "NIX_LD_LIBRARY_PATH=";
       ctx.nix_ld_lib_path = val;
+      skip = true;
     } else if ((val = get_env(*e, "LD_LIBRARY_PATH="))) {
       ctx.ld_lib_path = val;
-      ctx.ld_lib_path_envp = e;
+      skip = true;
+    }
+
+    if (!skip) {
+      new_envp[envp_current] = *e;
+      envp_current++;
     }
   }
+
+  ctx.envp = new_envp;
+  ctx.ld_lib_path_envp = &new_envp[envp_current];
 
   return ctx;
 }
@@ -334,32 +354,23 @@ static inline _Noreturn void jmp_ld(void (*entry_point)(void), void *stackp) {
   __builtin_unreachable();
 }
 
-static void insert_ld_library_path(struct ld_ctx *ctx) {
-  const size_t old_len = strlen(ctx->nix_lib_path_prefix);
-  const size_t new_len = strlen("LD_LIBRARY_PATH=");
-
-  char *env = ctx->nix_ld_lib_path - old_len;
-
-  // insert new shorter variable
-  memcpy(env, "LD_LIBRARY_PATH=", new_len);
-  // shift the old content left
-  memmove(env + new_len, ctx->nix_ld_lib_path, strlen(env) + new_len - old_len);
-}
-
 static int update_ld_library_path(struct ld_ctx *ctx) {
-  const size_t prefix_len = strlen("LD_LIBRARY_PATH=");
+  const char *prefix = "LD_LIBRARY_PATH=";
+  const size_t prefix_len = strlen(prefix);
+  size_t var_len = 0;
+  char *sep = "";
 
-  char *env = ctx->ld_lib_path - prefix_len;
-  const size_t var_len = prefix_len + strlen(ctx->ld_lib_path);
-  const char *sep;
-  if (var_len == prefix_len || env[var_len] == ':') {
-    // empty library path or ends with :
-    sep = "";
-  } else {
-    sep = ":";
+  if (ctx->ld_lib_path) {
+    var_len = strlen(ctx->ld_lib_path);
+    if (var_len == 0 || ctx->ld_lib_path[var_len] == ':') {
+      // empty library path or ends with :
+      sep = "";
+    } else {
+      sep = ":";
+    }
   }
-  const size_t new_size =
-    var_len + strlen(sep) + strlen(ctx->nix_ld_lib_path) + 1;
+
+  const size_t new_size = prefix_len + var_len + strlen(sep) + strlen(ctx->nix_ld_lib_path) + 1;
   char *new_str = mmap(NULL, new_size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 
   if (new_str == MAP_FAILED) {
@@ -367,8 +378,13 @@ static int update_ld_library_path(struct ld_ctx *ctx) {
   }
 
   // same as LD_LIBRARY_PATH=oldvalue:$NIX_LD_LIBRARY_PATH
-  strlcpy(new_str, env, new_size);
-  strlcat(new_str, sep, new_size);
+  strlcpy(new_str, prefix, new_size);
+
+  if (ctx->ld_lib_path) {
+    strlcat(new_str, ctx->ld_lib_path, new_size);
+    strlcat(new_str, sep, new_size);
+  };
+
   strlcat(new_str, ctx->nix_ld_lib_path, new_size);
 
   *ctx->ld_lib_path_envp = new_str;
@@ -422,20 +438,14 @@ int main(int argc, char** argv, char** envp) {
     return 1;
   }
 
-  if (ctx.nix_ld_lib_path) {
-    if (ctx.ld_lib_path) {
-      update_ld_library_path(&ctx);
-    } else {
-      insert_ld_library_path(&ctx);
-    }
-  }
+  update_ld_library_path(&ctx);
 
   size_t *at_base = get_at_base(auxv);
   if (at_base) {
     if (*at_base == 0) {
       // We have been executed as a dynamic executable, so we need to execute
       // the interpreter as a dynamic executable.
-      execve(ctx.nix_ld, argv, envp);
+      execve(ctx.nix_ld, argv, ctx.envp);
     }
     *at_base = ctx.load_addr;
   }
